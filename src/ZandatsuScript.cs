@@ -7,14 +7,73 @@ using UnityEngine;
 
 namespace Zandatsu
 {
-    /// <summary>
-    /// Free-angle slicing (Metal Gear Rising style). A clean, fast slash cuts the whole creature along the plane spanned
-    /// by the blade axis and the swing direction; the halves become small ragdolls that can be cut again.
-    /// </summary>
     public class ZandatsuScript : ThunderScript
     {
         private const string Cat = "Zandatsu";
 
+        // --- НАШИ НОВЫЕ НАСТРОЙКИ (МНОГОУДАРНЫЙ РАЗРЕЗ И РАЗРЫВ РУКАМИ) ---
+        [ModOption("Hits To Cut", "How many identical slashes along the same line are required to cut or weaken", nameof(MultiHitValues), order = -5, category = Cat, defaultValueIndex = 2)]
+        public static int RequiredHits = 3;
+
+        [ModOption("Hand Tear Mode", "After N hits, weaken the enemy so you can grab both sides and tear them apart with bare hands (off = slice immediately on Nth hit)", order = -4, category = Cat)]
+        public static bool RequireHandTear = true;
+
+        [ModOption("Hand Tear Speed", "How fast (m/s) you must pull your hands apart to tear a weakened enemy", nameof(TearSpeedValues), order = -3, category = Cat, defaultValueIndex = 1)]
+        public static float MinTearSpeed = 1.8f;
+
+        [ModOption("Cut Angle Tolerance", "Max angle difference (degrees) between consecutive slashes", nameof(AngleToleranceValues), order = -2, category = Cat, defaultValueIndex = 2)]
+        public static float MaxAngleDifference = 20f;
+
+        [ModOption("Cut Distance Tolerance", "Max distance (cm) from the initial cut line", nameof(DistanceToleranceValues), order = -1, category = Cat, defaultValueIndex = 1)]
+        public static float MaxDistanceCm = 10f;
+
+        public static ModOptionInt[] MultiHitValues() => new[]
+        {
+            new ModOptionInt("1 (Instant)", 1),
+            new ModOptionInt("2 Hits", 2),
+            new ModOptionInt("3 Hits", 3),
+            new ModOptionInt("4 Hits", 4),
+            new ModOptionInt("5 Hits", 5)
+        };
+
+        public static ModOptionFloat[] TearSpeedValues() => new[]
+        {
+            new ModOptionFloat("Easy (1.2 m/s)", 1.2f),
+            new ModOptionFloat("Normal (1.8 m/s)", 1.8f),
+            new ModOptionFloat("Hard (2.5 m/s)", 2.5f)
+        };
+
+        public static ModOptionFloat[] AngleToleranceValues() => new[]
+        {
+            new ModOptionFloat("10° (Strict)", 10f),
+            new ModOptionFloat("15°", 15f),
+            new ModOptionFloat("20° (Normal)", 20f),
+            new ModOptionFloat("35° (Easy)", 35f)
+        };
+
+        public static ModOptionFloat[] DistanceToleranceValues() => new[]
+        {
+            new ModOptionFloat("5 cm", 5f),
+            new ModOptionFloat("10 cm", 10f),
+            new ModOptionFloat("20 cm", 20f)
+        };
+
+        private class CutProgress
+        {
+            public Transform ReferenceBone;
+            public Vector3 LocalPoint;
+            public Vector3 LocalNormal;
+            public int CurrentHits;
+            public float LastHitTime;
+            public bool IsReadyToTear;
+            public RagdollPart HitPart;
+            public Item LastItem;
+            public float LastFire;
+        }
+
+        private readonly Dictionary<Creature, CutProgress> activeCuts = new Dictionary<Creature, CutProgress>();
+
+        // --- ОРИГИНАЛЬНЫЕ НАСТРОЙКИ ZANDATSU ---
         [ModOption("Enabled", "Free-angle slicing on/off", order = 0, category = Cat)]
         public static bool Enabled = true;
 
@@ -39,50 +98,46 @@ namespace Zandatsu
         [ModOption("Cut Weapons", "Fast edge swings also cut enemy weapons and shields (and dropped ones): the half with the grip stays a shorter weapon, the other half falls", order = 8, category = Cat)]
         public static bool CutWeapons = true;
 
-        [ModOption("Cut Props", "Fast edge swings also cut loose objects: barrels, pottery, rocks, logs, benches, stools, carts, baskets and more. The bigger half stays the object, the other half falls; the cut face shows the object's own surface. Breakable ones are cut instead of shattering. Objects the game keeps compressed (crates, chairs, tables, fruit) are read through zandatsu.shaders: without that file they cannot be cut and break as usual", order = 9, category = Cat)]
+        [ModOption("Cut Props", "Fast edge swings also cut loose objects: barrels, pottery, rocks, logs, benches, stools, carts, baskets and more.", order = 9, category = Cat)]
         public static bool CutProps = true;
 
         [ModOption("Palm Chop Cuts", "With the Martial Protege skill: an open-palm chop that would take a limb off at the joint cuts along the palm instead, like a blade", order = 10, category = Cat)]
         public static bool PalmChopCuts = true;
 
-        [ModOption("Fire Cuts Burn", "A blade imbued with fire chars the cut: a dark seared cut face with a ragged burnt rim that glows and dies down, smoke and sizzle", order = 11, category = Cat)]
+        [ModOption("Fire Cuts Burn", "A blade imbued with fire chars the cut", order = 11, category = Cat)]
         public static bool FireCutsBurn = true;
 
-        [ModOption("Hot Blade Cuts Easier", "A blade imbued with fire cuts with a slower swing (full charge: half the Min Swing Speed)", order = 12, category = Cat)]
+        [ModOption("Hot Blade Cuts Easier", "A blade imbued with fire cuts with a slower swing", order = 12, category = Cat)]
         public static bool HotBladeCutsEasier = true;
 
-        [ModOption("Plain Blade Heats Steel", "A cut through metal (armour, weapons, shields) glows dull red even from a blade without fire; off = the cut metal stays cold grey unless the blade burns", order = 13, category = Cat)]
+        [ModOption("Plain Blade Heats Steel", "A cut through metal glows dull red even from a blade without fire", order = 13, category = Cat)]
         public static bool PlainBladeHeatsSteel = true;
 
-        [ModOption("Hybrid Cuts", "The half with the hips stays the enemy (a real corpse with its handles); off = both halves become loose pieces", order = 14, category = Cat)]
+        [ModOption("Hybrid Cuts", "The half with the hips stays the enemy (a real corpse with its handles)", order = 14, category = Cat)]
         public static bool HybridCuts = true;
 
-        [ModOption("Limb Cuts Not Fatal", "With Hybrid Cuts: an enemy who only loses an arm or a leg lives on until he bleeds out. A cut-off hand drops its weapon; without a leg he goes down and stays down", order = 15, category = Cat)]
+        [ModOption("Limb Cuts Not Fatal", "With Hybrid Cuts: an enemy who only loses an arm or a leg lives on until he bleeds out", order = 15, category = Cat)]
         public static bool LimbCutsNotFatal = true;
 
-        [ModOption("Bleed Out Time", "Seconds an enemy lives after losing a limb (each further limb halves what is left)", nameof(BleedValues), order = 16, category = Cat, defaultValueIndex = 3)]
+        [ModOption("Bleed Out Time", "Seconds an enemy lives after losing a limb", nameof(BleedValues), order = 16, category = Cat, defaultValueIndex = 3)]
         public static float BleedOutTime = 20f;
 
-        [ModOption("Vanilla Dismemberment", "Keep the game's joint-only dismemberment too: by weapons, tearing, spells and Shard Striker (off: the game splits no bodies at the joints)", order = 17, category = Cat, defaultValueIndex = 0)]
+        [ModOption("Vanilla Dismemberment", "Keep the game's joint-only dismemberment too", order = 17, category = Cat, defaultValueIndex = 0)]
         public static bool VanillaDismemberment = false;
 
-        /// <summary>
-        /// The game's own Dismemberment content setting (its gore options; the game's slicing checks it in TrySlice).
-        /// Off: Zandatsu cuts no bodies either. Weapons are still cut.
-        /// </summary>
         public static bool GoreAllowed
         {
             get
             {
                 try { return GameManager.CheckContentActive(BuildSettings.ContentFlag.Dismemberment); }
-                catch { return true; }   // settings not loaded yet
+                catch { return true; }
             }
         }
 
         [ModOption("Slow Motion On Cut", "Short slow-motion on every body cut", order = 18, category = Cat, defaultValueIndex = 0)]
         public static bool SlowMotionOnCut = false;
 
-        [ModOption("Cut Sound", "Play the flesh slice sound on every cut (blood stays when off)", order = 19, category = Cat)]
+        [ModOption("Cut Sound", "Play the flesh slice sound on every cut", order = 19, category = Cat)]
         public static bool CutSound = true;
 
         [ModOption("Separation Speed", "How hard the halves push apart (m/s)", nameof(SeparationValues), order = 20, category = Cat, defaultValueIndex = 2)]
@@ -94,245 +149,36 @@ namespace Zandatsu
         [ModOption("Piece Lifetime", "Seconds before a piece disappears (0 = never)", nameof(LifetimeValues), order = 22, category = Cat, defaultValueIndex = 4)]
         public static float PieceLifetime = 120f;
 
-        [ModOption("Grab Pieces", "Grip near a piece (of an enemy, or a cut-off half of a weapon or object) to pick it up (release grip to drop or throw)", order = 23, category = Cat)]
+        [ModOption("Grab Pieces", "Grip near a piece to pick it up", order = 23, category = Cat)]
         public static bool GrabPieces = true;
 
-        [ModOption("Piece Stiffness", "How firmly pieces keep the pose they had when cut (0 = limp like a vanilla corpse)", nameof(StiffnessValues), order = 24, category = Cat, defaultValueIndex = 4)]
+        [ModOption("Piece Stiffness", "How firmly pieces keep the pose they had when cut", nameof(StiffnessValues), order = 24, category = Cat, defaultValueIndex = 4)]
         public static float PieceStiffness = 1f;
 
         [ModOption("Debug Key F9", "F9 (desktop keyboard) cuts the nearest enemy with a random plane", order = 25, category = Cat, defaultValueIndex = 0)]
         public static bool DebugKey = false;
 
-        [ModOption("Tear Limbs", "Use the game's joint break for Rip and Tear and two-handed grabs, with detachable Zandatsu limbs and Hybrid Cuts", order = 26, category = Cat)]
+        [ModOption("Tear Limbs", "Use the game's joint break for Rip and Tear and two-handed grabs", order = 26, category = Cat)]
         public static bool TearLimbs = true;
 
-        public static ModOptionFloat[] SpeedValues() => ModOptionFloat.CreateArray(1f, 40f, 0.5f);   // index 12 = 7 m/s default; damage curves top out at 20, fast wrist flicks reach 30+
+        public static ModOptionFloat[] SpeedValues() => ModOptionFloat.CreateArray(1f, 40f, 0.5f);
         public static ModOptionFloat[] SeparationValues() => ModOptionFloat.CreateArray(0f, 5f, 0.5f);
         public static ModOptionInt[] MaxPieceValues() => ModOptionInt.CreateArray(10, 200, 10);
         public static ModOptionFloat[] LifetimeValues() => ModOptionFloat.CreateArray(0f, 600f, 30f);
         public static ModOptionFloat[] StiffnessValues() => ModOptionFloat.CreateArray(0f, 3f, 0.25f);
-        public static ModOptionFloat[] BleedValues() => ModOptionFloat.CreateArray(5f, 120f, 5f);   // index 3 = 20 s
+        public static ModOptionFloat[] BleedValues() => ModOptionFloat.CreateArray(5f, 120f, 5f);
 
-        public static ModOptionFloat[] RecutDelayValues()   // 0, 0.05 ... 0.5 s (index 10 = 0.5 default)
+        public static ModOptionFloat[] RecutDelayValues()
         {
             var values = new ModOptionFloat[11];
             for (int i = 0; i <= 10; i++) values[i] = new ModOptionFloat((i * 0.05f).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + " s", i * 0.05f);
             return values;
         }
 
-        public static ModOptionFloat[] HealthValues()   // Always, 90% ... 10%, Corpses only
+        public static ModOptionFloat[] HealthValues()
         {
             var values = new ModOptionFloat[11];
             values[0] = new ModOptionFloat("Always", 100f);
-            for (int i = 1; i <= 9; i++) values[i] = new ModOptionFloat((100 - 10 * i) + "%", 100f - 10f * i);
-            values[10] = new ModOptionFloat("Corpses only", 0f);
-            return values;
-        }
-
-        /// <summary>
-        /// Cut At Health: a living creature is cut only once its health is down to the set share of its maximum. damage: what
-        /// the blow being judged will take off (the hit event comes before the game applies it), so the blow that brings it
-        /// low, or kills it, cuts.
-        /// </summary>
-        private static bool HealthAllows(Creature c, float damage = 0f) =>
-            CutAtHealth >= 100f || c.isKilled || c.maxHealth <= 0f ||
-            c.currentHealth - Mathf.Max(0f, damage) <= c.maxHealth * CutAtHealth * 0.01f;
-        private struct PendingCut
-        {
-            public Creature creature;
-            public Vector3 point;
-            public Vector3 normal;
-            public Vector3 bladeVelocity;
-            public RagdollPart hitPart;
-            public Item item;
-            public float fire;   // fire charge on the blade, 0..1
-            public bool tear;
-        }
-
-        private readonly List<PendingCut> pending = new List<PendingCut>();
-        private readonly HashSet<Creature> claimed = new HashSet<Creature>();
-        // A second blade striking a creature that is still being cut (dual wielding) waits here instead of being
-        // dropped, and is applied to the creature and its fresh pieces as soon as the first cut is done.
-        private readonly Dictionary<Creature, Item> claimedBy = new Dictionary<Creature, Item>();
-        private readonly Dictionary<Creature, List<PendingCut>> deferred = new Dictionary<Creature, List<PendingCut>>();
-        // Hybrid cuts leave the creature in the world, so the blade still moving through it (or bouncing off) right after
-        // a cut started the next one at once: one swing split a body into three or four. One swing, one cut.
-        private struct LastCut { public Item item; public float time, touch; }   // touch: last time a lightsaber that cut it touched it
-        private readonly Dictionary<Creature, LastCut> lastCutBy = new Dictionary<Creature, LastCut>();
-        public const float SameSwingSeconds = 0.5f;
-        private readonly Dictionary<Damager, Vector3[]> lastBlade = new Dictionary<Damager, Vector3[]>();
-        private readonly Collider[] overlap = new Collider[512];   // room for a pile of pieces around what the blade hits
-        private readonly PieceGrab grab = new PieceGrab();
-        private readonly TearJoints tearJoints = new TearJoints();
-
-        public override void ScriptEnable()
-        {
-            base.ScriptEnable();
-            EventManager.onCreatureHit += OnCreatureHit;
-            EventManager.onLevelUnload += OnLevelUnload;
-            EventManager.onCreatureDespawn += OnCreatureDespawn;
-            EventManager.onCreatureSpawn += OnCreatureSpawn;
-            EventManager.onRagdollSliced += OnRagdollSliced;
-            if (Array.Exists(Environment.GetCommandLineArgs(), a => a.Equals("-zandatsutest", StringComparison.OrdinalIgnoreCase)))
-                EventManager.onLevelLoad += OnLevelLoadSelfTest;
-            Debug.Log("[Zandatsu] enabled - free-angle slicing active (ragdoll pieces)");
-            Warmup.Run();
-            // The hot steel texture is read from disk on first use: the first weapon cut of a session took 8 ms more.
-            Material preload = HotSteel.Create(null);
-            if (preload) UnityEngine.Object.Destroy(preload);
-            FireCut.Preload();
-            CapTextures.Preload();
-            LogFilter.Install();
-        }
-
-        public override void ScriptDisable()
-        {
-            EventManager.onCreatureHit -= OnCreatureHit;
-            EventManager.onLevelUnload -= OnLevelUnload;
-            EventManager.onCreatureDespawn -= OnCreatureDespawn;
-            EventManager.onCreatureSpawn -= OnCreatureSpawn;
-            EventManager.onRagdollSliced -= OnRagdollSliced;
-            EventManager.onLevelLoad -= OnLevelLoadSelfTest;   // subscribed only with -zandatsutest; harmless otherwise
-            LogFilter.Uninstall();
-            tearJoints.Clear();
-            EndVetoes();
-            Damager.dismembermentEnabled = GoreAllowed;
-            ClearPieces();
-            HybridState.ClearAll();
-            Survival.ClearAll();
-            ItemCut.ClearAll();
-            MeshCache.Clear();
-            waiting.Clear();
-            waitingSince.Clear();
-            base.ScriptDisable();
-        }
-
-        private void OnLevelUnload(LevelData levelData, LevelData.Mode mode, EventTime eventTime)
-        {
-            if (eventTime != EventTime.OnStart) return;
-            tearJoints.Clear();
-            EndVetoes();
-            ClearPieces();
-            HybridState.ClearAll();
-            Survival.ClearAll();
-            ItemCut.ClearAll();
-            MeshCache.Clear();
-            waiting.Clear();
-            waitingSince.Clear();
-            prewarmQueue.Clear();
-            prewarmRenderers.Clear();
-        }
-
-        // Creatures are pooled: whatever a hybrid cut changed on one is put back before it can be reused.
-        private void OnCreatureDespawn(Creature creature, EventTime eventTime)
-        {
-            if (eventTime != EventTime.OnStart) return;
-            tearJoints.Clear(creature);
-            RepairTornJoints(creature);
-            try { HybridState.OnDespawn(creature); }
-            catch (Exception e) { Debug.LogError("[Zandatsu] restoring hybrid-cut creature: " + e); }
-            try { Survival.OnDespawn(creature); }
-            catch (Exception e) { Debug.LogError("[Zandatsu] ending bleed-out: " + e); }
-        }
-
-        private void ClearPieces()
-        {
-            grab.ReleaseAll();
-            foreach (SlicedPiece p in SlicedPiece.all.ToArray())
-                if (p) p.Kill();
-        }
-
-        private void OnCreatureHit(Creature creature, CollisionInstance ci, EventTime eventTime)
-        {
-            try
-            {
-                if (!Enabled || creature == null || creature.isPlayer || !GoreAllowed) return;
-                Damager damager = ci?.damageStruct.damager;
-                if (eventTime == EventTime.OnStart && PalmChopCuts) NotePalmHit(creature, ci);
-                if (damager == null || damager.type != Damager.Type.Slash) return;
-                if (ItemCut.IsBlasterBolt(damager.collisionHandler ? damager.collisionHandler.item : null)) return;   // a shot, not a blade
-                if (StillIn(creature, damager.collisionHandler ? damager.collisionHandler.item : null)) return;
-                if (!ci.IsDoneByPlayer()) return;
-                float speed = ci.impactVelocity.magnitude;
-                float fire = FireCut.Charge(ci.sourceColliderGroup);
-                if (speed < FireCut.MinSpeed(MinSwingSpeed, fire)) return;
-                // Same conditions the game uses for its own slicing: edge at a good angle that actually bit in.
-                // Metal armour never lets the blade bite in (its material modifier forbids penetration), so with
-                // Cut Through Armour a good edge angle is enough.
-                if (CleanCutsOnly && (ci.damageStruct.badAngle ||
-                    (!CutThroughArmour && ci.damageStruct.penetration != DamageStruct.Penetration.Hit))) return;
-                if (!HealthAllows(creature, eventTime == EventTime.OnStart ? ci.damageStruct.damage : 0f)) return;
-                // A blow that cuts into a limb must not kill by its damage (the game applies it after this event): if the cut
-                // takes only the limb, the bleed-out decides; if it goes through the body after all, FinishJob kills.
-                if (eventTime == EventTime.OnStart && LimbCutsNotFatal && HybridCuts && !creature.isKilled &&
-                    ci.damageStruct.hitRagdollPart && Survival.IsLimb(ci.damageStruct.hitRagdollPart.type))
-                    ci.damageStruct.damage = Mathf.Min(ci.damageStruct.damage, Survival.BlowDamage);
-
-                Vector3 bladeAxis = damager.transform.up;
-                Vector3 normal = Vector3.Cross(bladeAxis, ci.impactVelocity);
-                if (normal.sqrMagnitude < 1e-4f * speed * speed) normal = damager.transform.right;
-
-                Claim(new PendingCut
-                {
-                    creature = creature,
-                    point = ci.contactPoint,
-                    normal = normal.normalized,
-                    bladeVelocity = ci.impactVelocity,
-                    hitPart = ci.damageStruct.hitRagdollPart,
-                    item = damager.collisionHandler ? damager.collisionHandler.item : null,
-                    fire = fire
-                });
-            }
-            catch (Exception e)
-            {
-                Debug.LogError("[Zandatsu] OnCreatureHit: " + e);
-            }
-        }
-
-        public override void ScriptUpdate()
-        {
-            bool gore = GoreAllowed;
-            Damager.dismembermentEnabled = gore && (VanillaDismemberment || !Enabled);
-
-            if (DebugKey && Input.GetKeyDown(KeyCode.F9)) DebugCutNearest();
-            HotSteel.Update();
-            ItemCut.Update();
-            FireCut.Update();
-            LogFilter.Update();
-            HybridState.KeepSeveredStill();
-            Survival.Update();
-            EndVetoes();
-            Creature pulling = gore && Enabled && TearLimbs && HybridCuts && !VanillaDismemberment && Player.local
-                ? Player.local.creature : null;
-            tearJoints.Update(pulling, claimed);
-            if (Enabled) Prewarm();
-            if (Enabled && GrabPieces) grab.Update();
-            else grab.ReleaseAll();
-        }
-
-        public override void ScriptLateUpdate()
-        {
-            if (pending.Count > 0)
-            {
-                PendingCut[] cuts = pending.ToArray();
-                pending.Clear();
-                foreach (PendingCut cut in cuts)
-                {
-                    try { StartCreatureCut(cut); }
-                    catch (Exception e)
-                    {
-                        claimed.Remove(cut.creature);
-                        Debug.LogError("[Zandatsu] CutCreature: " + e);
-                    }
-                }
-                pending.AddRange(waiting);
-                waiting.Clear();
-            }
-            if (jobs.Count > 0) FinishJobs();
-            // The blade sweep cuts weapons too: without CutWeapons here, Cut Weapons did nothing while Cut Through Armour was off.
-            if (Enabled && (CutThroughArmour || CutWeapons || CutProps || (RecutPieces && (SlicedPiece.all.Count > 0 || ItemDebris.Count > 0)))) SweepBlades();
-            else lastBlade.Clear();
-        }
 
         // ---------------- cut jobs ----------------
         // Main thread: snapshot skeleton, bake skinned meshes, clone materials.
